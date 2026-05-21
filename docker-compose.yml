@@ -1,0 +1,51 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Persistent API server — model loads ONCE at startup, stays warm forever
+  api:
+    build: .
+    env_file: .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    entrypoint: ["uvicorn", "paper_intel.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - papers_data:/app/data/papers
+      - index_data:/app/data/index
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+  # One-shot CLI — only used for manual commands
+  app:
+    build: .
+    env_file: .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      - papers_data:/app/data/papers
+      - index_data:/app/data/index
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    profiles:
+      - cli
+
+volumes:
+  qdrant_data:
+  papers_data:
+  index_data:
+  hf_cache:
