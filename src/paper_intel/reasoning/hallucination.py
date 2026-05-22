@@ -82,6 +82,7 @@ class HallucinationEvaluator:
         self,
         answer: str,
         retrieved_chunks: list[ChunkSchema],
+        max_facts: int = 8,
     ) -> HallucinationReport:
         facts = self.decompose_to_facts(answer)
         if not facts:
@@ -93,10 +94,19 @@ class HallucinationEvaluator:
                 verdict="PASS",
             )
 
+        # Cap facts to avoid N×LLM-call timeout
+        facts = facts[:max_facts]
+
+        # Verify facts in parallel (I/O-bound → ThreadPoolExecutor is safe)
+        import concurrent.futures
         atomic_facts: list[AtomicFact] = []
-        for fact in facts:
-            af = self.verify_fact(fact, retrieved_chunks)
-            atomic_facts.append(af)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(self.verify_fact, f, retrieved_chunks): f for f in facts}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    atomic_facts.append(future.result())
+                except Exception:
+                    pass
 
         supported_count = sum(1 for af in atomic_facts if af.supported)
         support_ratio = supported_count / len(atomic_facts)

@@ -41,24 +41,6 @@ if TYPE_CHECKING:
     pass
 
 
-_ARXIV_NEW_ID = re.compile(r"\b\d{4}\.\d{4,5}\b")
-_ARXIV_OLD_ID = re.compile(r"\b[a-z\-]+/\d{7}\b", re.IGNORECASE)
-
-
-def _extract_arxiv_ids(text: str) -> list[str]:
-    if not text:
-        return []
-    found = _ARXIV_NEW_ID.findall(text) + _ARXIV_OLD_ID.findall(text)
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    out: list[str] = []
-    for pid in found:
-        if pid not in seen:
-            seen.add(pid)
-            out.append(pid)
-    return out
-
-
 def _replace_uuid_citations(answer: str, chunks: list) -> str:
     """Replace raw UUID citation markers with readable [Author et al., Year] labels."""
     if not chunks:
@@ -82,27 +64,22 @@ def _replace_uuid_citations(answer: str, chunks: list) -> str:
 
     _F = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     _P = r"[0-9a-f]{8}"
-    # Replace a variety of citation formats models tend to emit:
-    # - (Chunk <uuid>) / (Chunk <8-hex>) and variants without the "Chunk" prefix
-    # - Chunk <uuid> / Chunk <8-hex> without parens
-    # - [<uuid>] / [<8-hex>] and 【<uuid>】 / 【<8-hex】
-    # - bare full UUID
+    # Patterns (ordered most specific first):
+    # 1. (Chunk/chunk full-uuid) or (Chunk/chunk 8-hex)
+    # 2. bare "chunk full-uuid" or "chunk 8-hex" without parens
+    # 3. [full-uuid] or 【full-uuid】 (unicode lenticular brackets)
+    # 4. bare full-uuid
     uuid_pat = re.compile(
-        rf"""
-        \((?:[Cc]hunk\s+)?(?P<full>{_F})\)
-        |\((?:[Cc]hunk\s+)?(?P<prefix>{_P})\)
-        |(?<!\w)[Cc]hunk\s+(?P<full2>{_F})(?!\w)
-        |(?<!\w)[Cc]hunk\s+(?P<prefix2>{_P})(?!\w)
-        |[\[【](?P<full3>{_F})[\]】]
-        |[\[【](?P<prefix3>{_P})[\]】]
-        |(?P<full4>{_F})
-        """,
-        re.IGNORECASE | re.VERBOSE,
+        rf"\((?:[Cc]hunk\s+)(({_F})|({_P}))\)"
+        rf"|(?<!\w)[Cc]hunk\s+(({_F})|({_P}))(?!\w)"
+        rf"|[\[【](({_F}))[\]】]"
+        rf"|({_F})",
+        re.IGNORECASE,
     )
 
     def _sub(m) -> str:
-        full = m.group("full") or m.group("full2") or m.group("full3") or m.group("full4")
-        pre  = m.group("prefix") or m.group("prefix2") or m.group("prefix3")
+        full = m.group(2) or m.group(4) or m.group(7) or m.group(8)
+        pre  = m.group(3) or m.group(5)
         if full:
             lbl = cid_to_label.get(full) or cid_to_label.get(full.lower())
             if lbl:
@@ -162,7 +139,6 @@ class AgentState:
     question: str
     messages: list[dict] = field(default_factory=list)
     chunk_cache: dict[str, ChunkSchema] = field(default_factory=dict)
-    focus_paper_ids: list[str] = field(default_factory=list)
     iteration: int = 0
     final_answer: FinalAnswer | None = None
     consecutive_empty_searches: int = 0
@@ -189,7 +165,6 @@ class ReactAgent:
         state = AgentState(question=question)
         # Prepend prior conversation turns so the model has context
         state.messages = (history or []) + [{"role": "user", "content": question}]
-        state.focus_paper_ids = _extract_arxiv_ids(question)
 
         while state.iteration < self.max_iterations and state.final_answer is None:
             state = self._step(state)
@@ -218,16 +193,22 @@ class ReactAgent:
         )
 
     def _step(self, state: AgentState) -> AgentState:
-        # Hard cap: ≥3 successful searches → force finalize, no more LLM calls
-        if state.successful_searches >= 3:
+        # Hard cap: ≥4 successful searches → force finalize immediately, no more LLM calls
+        if state.successful_searches >= 4:
             state.final_answer = self._force_finalize(state)
             return state
 
-        # After 2 searches: only offer finalize_answer — physically removes search tools
-        # so the model cannot search again even if it wants to.
-        only_finalize = state.successful_searches >= 2
+        # Soft nudge: exactly 3 successful searches → inject one-time instruction before LLM call
+        if state.successful_searches == 3:
+            state.messages.append({
+                "role": "user",
+                "content": (
+                    "You have now retrieved sufficient evidence from 3 searches. "
+                    "You MUST call finalize_answer next. Do NOT search again."
+                ),
+            })
 
-        response = self._call_llm(state, only_finalize=only_finalize)
+        response = self._call_llm(state)
         state.iteration += 1
 
         message = response.choices[0].message
@@ -246,19 +227,7 @@ class ReactAgent:
         state.messages.append(assistant_msg)
 
         if not tool_calls:
-            answer_text = message.content or ""
-            state.final_answer = FinalAnswer(
-                answer=answer_text,
-                cited_chunk_ids=list(state.chunk_cache.keys()),
-            )
-            state.trace.append(TraceStep(
-                iteration=state.iteration,
-                tool="final_answer",
-                input_summary="",
-                result_summary=answer_text[:200],
-            ))
-            if self.step_callback:
-                self.step_callback("final_answer", "", answer_text[:120])
+            state.final_answer = FinalAnswer(answer=message.content or "", cited_chunk_ids=[])
             return state
 
         for tool_call in tool_calls:
@@ -266,13 +235,6 @@ class ReactAgent:
             tool_input = json.loads(tool_call.function.arguments)
             if tool_name == "finalize_answer":
                 tool_input = _unwrap_args(tool_input)
-
-            # Guardrail: if the user explicitly referenced arXiv IDs in their
-            # question, constrain hybrid_search to those papers unless the
-            # model already provided a paper_ids filter.
-            if tool_name == "hybrid_search":
-                if state.focus_paper_ids and not tool_input.get("paper_ids"):
-                    tool_input["paper_ids"] = list(state.focus_paper_ids)
 
             result, state.chunk_cache = self.executor.execute(
                 tool_name, tool_input, state.chunk_cache
@@ -340,17 +302,13 @@ class ReactAgent:
 
         return state
 
-    def _call_llm(self, state: AgentState, only_finalize: bool = False):
+    def _call_llm(self, state: AgentState):
         messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + state.messages
-        # When only_finalize=True the model can only call finalize_answer — it cannot
-        # search again. This is stronger than a nudge message which the model can ignore.
-        tools = [t for t in TOOLS if t["function"]["name"] == "finalize_answer"] \
-                if only_finalize else TOOLS
         try:
             return self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=2048,
-                tools=tools,
+                tools=TOOLS,
                 messages=messages,
             )
         except RateLimitError:
@@ -400,55 +358,40 @@ class ReactAgent:
         raise exc
 
     def _force_finalize(self, state: AgentState) -> FinalAnswer:
-        """
-        Synthesise a final answer from whatever the agent retrieved so far.
-        Calls the LLM WITHOUT tools so it must produce plain text — no
-        tool-call JSON format that can be truncated or rejected.
-        """
-        if not state.chunk_cache:
-            return FinalAnswer(
-                answer="Unable to produce an answer — no evidence was retrieved.",
-                cited_chunk_ids=[],
-            )
-
-        # Build a compact evidence block from the retrieved chunks
-        chunks = list(state.chunk_cache.values())
-        evidence = "\n\n".join(
-            f"[{c.paper_title} | {c.section}]\n{c.text[:500]}"
-            for c in chunks[:8]
-        )
-        synthesis_prompt = (
-            f"Using ONLY the evidence below, write a thorough answer to the question.\n"
-            f"Cite each claim as [PaperTitle, Year]. Do not invent facts.\n\n"
-            f"QUESTION: {state.question}\n\n"
-            f"EVIDENCE:\n{evidence}"
-        )
+        state.messages.append({
+            "role": "user",
+            "content": (
+                "You have reached the maximum number of reasoning steps. "
+                "Please call finalize_answer now with the best answer you can produce "
+                "based on the evidence retrieved so far."
+            ),
+        })
         try:
-            # No tools parameter → model returns plain text, never a tool call.
-            # This is reliable even when the full ReAct context is exhausted.
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=2048,
-                messages=[
-                    {"role": "system", "content": "You are a precise research assistant. Answer only from the provided evidence."},
-                    {"role": "user",   "content": synthesis_prompt},
-                ],
-            )
-            answer = (response.choices[0].message.content or "").strip()
-            if answer:
-                return FinalAnswer(
-                    answer=answer,
-                    cited_chunk_ids=[c.chunk_id for c in chunks[:8]],
-                )
+            response = self._call_llm(state)
+            message = response.choices[0].message
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    if tc.function.name == "finalize_answer":
+                        data = _unwrap_args(json.loads(tc.function.arguments))
+                        answer = data.get("answer", "")
+                        if answer:
+                            return FinalAnswer(
+                                answer=answer,
+                                cited_chunk_ids=data.get("cited_chunk_ids", []),
+                                contradiction_flags=data.get("contradiction_flags", []),
+                            )
+            if message.content:
+                return FinalAnswer(answer=message.content, cited_chunk_ids=[])
         except Exception:
             pass
 
-        # Absolute last resort — should almost never be reached
+        # Last resort: synthesize a brief answer directly from retrieved chunks
+        # without another LLM call — avoids a second TPM hit on exhausted context.
         if state.chunk_cache:
-            chunks_fb = list(state.chunk_cache.values())[:3]
+            chunks = list(state.chunk_cache.values())[:3]
             excerpts = "\n\n".join(
                 f"[{c.paper_title} — {c.section}]\n{c.text[:300]}"
-                for c in chunks_fb
+                for c in chunks
             )
             return FinalAnswer(
                 answer=(

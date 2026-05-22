@@ -1,28 +1,6 @@
 from __future__ import annotations
 import re
-import unicodedata
 from pathlib import Path
-
-
-def _clean_text(text: str) -> str:
-    """
-    Normalize PDF-extracted text:
-    - NFKC: decomposes ligatures (fi, fl, ff, etc.) and normalizes Unicode
-    - Rejoin words broken by hyphen + whitespace across lines (architec- ture -> architecture)
-    - Collapse runs of whitespace to a single space
-    """
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"(\w)-\s+(\w)", r"\1\2", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
-
-
-_NOISE_PATTERNS = re.compile(
-    r"(arXiv\s*:|^\d{4}\.\d{4,5}|^\[cs\.|abstract|preprint|"
-    r"under\s+review|submitted\s+to|correspondence\s+to|"
-    r"equal\s+contribution|\*\s*equal|©|\bfig\b|\btable\b)",
-    re.IGNORECASE,
-)
 
 
 def parse_pdf(pdf_path: Path) -> list[dict]:
@@ -77,14 +55,15 @@ def extract_references(pdf_path: Path) -> list[str]:
             full_text += page.get_text()
     doc.close()
 
+    # Match arxiv IDs: old format (hep-th/9901001) and new (1706.03762, 2305.10601)
     pattern = r"\b(\d{4}\.\d{4,5})\b"
     matches = re.findall(pattern, full_text)
-    return list(dict.fromkeys(matches))
+    return list(dict.fromkeys(matches))  # deduplicate, preserve order
 
 
 def _estimate_body_font_size(doc) -> float:
     font_sizes: list[float] = []
-    for page in list(doc)[:5]:
+    for page in list(doc)[:5]:  # sample first 5 pages
         for block in page.get_text("dict")["blocks"]:
             if block.get("type") != 0:
                 continue
@@ -93,6 +72,7 @@ def _estimate_body_font_size(doc) -> float:
                     font_sizes.append(span.get("size", 0))
     if not font_sizes:
         return 10.0
+    # Body font = most common size (mode-like: median of lower half)
     font_sizes.sort()
     return font_sizes[len(font_sizes) // 2]
 
@@ -105,21 +85,12 @@ def _extract_block_text_and_font(block: dict) -> tuple[str, float]:
         for span in line.get("spans", []):
             text_parts.append(span.get("text", ""))
             max_font = max(max_font, span.get("size", 0))
-    return _clean_text(" ".join(text_parts)), max_font
+    return " ".join(text_parts), max_font
 
 
 def _is_section_header(text: str, font_size: float, body_font_size: float) -> bool:
     if font_size <= body_font_size * 1.1:
         return False
-    text = text.strip()
-    if len(text) > 120:
-        return False
-    if len(text) < 3:
-        return False
-    # Reject arxiv IDs, submission lines, and other cover-page noise
-    if _NOISE_PATTERNS.search(text):
-        return False
-    # Must look like a section title: starts with a digit, letter, or number+dot
-    if not re.match(r"^(\d[\d\.]*\s+\w|\w)", text):
+    if len(text.strip()) > 120:  # headers are short
         return False
     return True

@@ -46,8 +46,14 @@ class HybridRetriever:
         sparse_results = self.sparse.retrieve(query, top_k=sparse_candidates)
 
         # If paper_id filter is active, restrict sparse results to those papers too
-        if paper_ids:
-            sparse_results = [(cid, s) for cid, s in sparse_results if _chunk_in_papers(cid, paper_ids)]
+        if paper_ids and sparse_results:
+            allowed_papers = set(paper_ids)
+            id_to_paper = self.store.get_paper_ids_by_chunk_ids([cid for cid, _ in sparse_results])
+            sparse_results = [
+                (cid, score)
+                for cid, score in sparse_results
+                if id_to_paper.get(cid) in allowed_papers
+            ]
 
         fused = reciprocal_rank_fusion([dense_results, sparse_results], k=self.rrf_k)
         top_ids = [chunk_id for chunk_id, _ in fused[:top_k]]
@@ -56,10 +62,3 @@ class HybridRetriever:
         # Preserve RRF order
         id_to_chunk = {c.chunk_id: c for c in chunks}
         return [id_to_chunk[cid] for cid in top_ids if cid in id_to_chunk]
-
-
-def _chunk_in_papers(chunk_id: str, paper_ids: list[str]) -> bool:
-    # BM25 index doesn't carry paper metadata — rely on Qdrant filter for dense,
-    # and post-filter sparse by fetching payload. For now, skip this pre-filter
-    # (the Qdrant post-fetch in get_chunks_by_ids will naturally include all papers).
-    return True

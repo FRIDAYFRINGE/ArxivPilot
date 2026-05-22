@@ -11,29 +11,89 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── sidebar ──────────────────────────────────────────────────────────────────
+# ── session init ──────────────────────────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+if "eval_hallucination" not in st.session_state:
+    st.session_state.eval_hallucination = False
+
+
+# ── helper — MUST be defined before any call site ────────────────────────────
+def _render_meta(meta: dict) -> None:
+    """Render trace, sources and hallucination report under an assistant bubble."""
+    cols = st.columns(3)
+    cols[0].caption(f"🔁 {meta['iterations']} steps")
+
+    if meta.get("hallucination"):
+        h = meta["hallucination"]
+        icon = {"PASS": "🟢", "WARN": "🟡", "FAIL": "🔴"}.get(h["verdict"], "⚪")
+        cols[1].caption(f"{icon} {h['verdict']} — {h['supported_facts']}/{h['total_facts']} facts")
+
+    with st.expander(f"🔍 ReAct trace ({meta['iterations']} steps)"):
+        for step in meta["trace"]:
+            icon_map = {"hybrid_search": "🔍", "expand_citations": "🕸",
+                        "check_contradiction": "⚖", "finalize_answer": "✓"}
+            st.markdown(f"**{icon_map.get(step['tool'], '→')} Step {step['iteration']} `{step['tool']}`**")
+            st.code(
+                f"IN:  {step['input_summary'][:120]}\nOUT: {step['result_summary'][:120]}",
+                language=None,
+            )
+
+    if meta.get("cited_chunks"):
+        with st.expander(f"📚 Sources ({len(meta['cited_chunks'])} chunks)"):
+            for chunk in meta["cited_chunks"]:
+                st.markdown(f"**{chunk['paper_title']}** `{chunk['paper_id']}`")
+                st.caption(f"Section: {chunk['section']}")
+                st.text(chunk["text"][:250])
+                st.divider()
+
+    if meta.get("hallucination") and meta["hallucination"].get("unsupported"):
+        with st.expander("⚠️ Unsupported facts"):
+            for f in meta["hallucination"]["unsupported"]:
+                st.caption(f"✗ {f}")
+
+
+# ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📄 Paper Intel")
     st.caption("Agentic RAG over ML/AI papers")
     st.divider()
 
-    # Index status
     try:
         s = requests.get(f"{API_URL}/status", timeout=5).json()
         col1, col2 = st.columns(2)
         col1.metric("Papers", s["indexed_papers"])
         col2.metric("Chunks", s["total_chunks"])
-        if s["paper_ids"]:
-            with st.expander("Indexed papers"):
-                for pid in s["paper_ids"]:
-                    st.caption(pid)
+        with st.expander("Indexed papers"):
+            for pid in s["paper_ids"]:
+                st.caption(pid)
     except Exception:
         st.warning("API not reachable")
 
     st.divider()
 
-    # Ingest single paper
-    st.subheader("Ingest a paper")
+    st.subheader("Chat settings")
+    st.session_state.eval_hallucination = st.checkbox(
+        "Hallucination eval", value=st.session_state.eval_hallucination,
+        help="Checks up to 8 facts against retrieved chunks. Adds ~15-30s."
+    )
+    max_steps = st.slider("Max agent steps", 2, 10, 6)
+
+    if st.button("🗑 New conversation", use_container_width=True):
+        if st.session_state.session_id:
+            try:
+                requests.delete(f"{API_URL}/session/{st.session_state.session_id}", timeout=5)
+            except Exception:
+                pass
+        st.session_state.messages = []
+        st.session_state.session_id = None
+        st.rerun()
+
+    st.divider()
+
+    st.subheader("Add papers")
     arxiv_id = st.text_input("arXiv ID", placeholder="e.g. 2310.06825")
     if st.button("Ingest", use_container_width=True) and arxiv_id.strip():
         with st.spinner(f"Ingesting {arxiv_id}..."):
@@ -50,12 +110,8 @@ with st.sidebar:
             else:
                 st.error(f"✗ {r['paper_id']}: {r['status']}")
 
-    st.divider()
-
-    # Bulk ingest by topic
-    st.subheader("Bulk ingest by topic")
-    query = st.text_input("Search query", placeholder="e.g. large language model")
-    max_p = st.slider("Max papers", 10, 200, 50)
+    query = st.text_input("Bulk ingest by topic", placeholder="e.g. diffusion models")
+    max_p  = st.slider("Max papers", 10, 200, 30)
     if st.button("Start bulk ingest", use_container_width=True) and query.strip():
         resp = requests.post(
             f"{API_URL}/ingest/search",
@@ -63,93 +119,84 @@ with st.sidebar:
             timeout=10,
         )
         if resp.status_code == 200:
-            st.success("Bulk ingestion started in background.")
-            st.caption("Check progress below.")
+            st.success("Ingestion started in background.")
         elif resp.status_code == 409:
-            st.warning("Already running — wait for it to finish.")
+            st.warning("Already running.")
         else:
             st.error(resp.text)
 
-    prog = requests.get(f"{API_URL}/ingest/progress", timeout=5).json()
-    if prog["running"]:
-        pct = prog["done"] / prog["total"] if prog["total"] else 0
-        st.progress(pct, text=f"{prog['done']}/{prog['total']} papers — {prog['query']}")
-    elif prog["done"] > 0:
-        st.caption(f"Last run: {prog['done']} papers, {prog['skipped']} skipped, {len(prog['errors'])} errors")
+    try:
+        prog = requests.get(f"{API_URL}/ingest/progress", timeout=5).json()
+        if prog["running"]:
+            pct = prog["done"] / prog["total"] if prog["total"] else 0
+            st.progress(pct, text=f"{prog['done']}/{prog['total']} — {prog['query'][:30]}")
+    except Exception:
+        pass
 
-# ── main area ─────────────────────────────────────────────────────────────────
-st.header("Ask a question")
 
-question = st.text_area(
-    "Question",
-    placeholder="e.g. How do attention mechanisms work in transformers?",
-    height=80,
-)
+# ── chat area ─────────────────────────────────────────────────────────────────
+st.header("💬 Research Assistant")
 
-col_a, col_b = st.columns([3, 1])
-with col_a:
-    max_steps = st.slider("Max agent steps", 2, 10, 6)
-with col_b:
-    eval_hall = st.checkbox("Hallucination eval", value=False)
-    st.caption("Slower — runs fact-checking")
+if st.session_state.session_id:
+    st.caption(f"Session `{st.session_state.session_id[:8]}…`  —  {len(st.session_state.messages)//2} turns")
+else:
+    st.caption("Ask a question to start a new session.")
 
-ask_btn = st.button("Ask ▶", type="primary", use_container_width=True)
+# Replay all prior messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and msg.get("meta"):
+            _render_meta(msg["meta"])
 
-if ask_btn and question.strip():
-    with st.spinner("Agent thinking..."):
-        resp = requests.post(
-            f"{API_URL}/ask",
-            json={
-                "question": question.strip(),
-                "max_steps": max_steps,
-                "eval_hallucination": eval_hall,
-            },
-            timeout=120,
-        )
+# ── input ─────────────────────────────────────────────────────────────────────
+if prompt := st.chat_input("Ask about the indexed papers…"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-    if resp.status_code == 200:
-        data = resp.json()
+    with st.chat_message("assistant"):
+        with st.spinner("Searching papers and reasoning…"):
+            try:
+                resp = requests.post(
+                    f"{API_URL}/ask",
+                    json={
+                        "question": prompt,
+                        "max_steps": max_steps,
+                        "eval_hallucination": st.session_state.eval_hallucination,
+                        "session_id": st.session_state.session_id,
+                    },
+                    timeout=300,
+                )
+            except requests.exceptions.Timeout:
+                st.error("Request timed out — try fewer agent steps or disable hallucination eval.")
+                st.stop()
+            except requests.exceptions.ConnectionError:
+                st.error("Cannot reach the API. Is the server running?")
+                st.stop()
 
-        # Answer
-        st.subheader("Answer")
-        st.markdown(data["answer"])
+        if resp.status_code == 200:
+            data = resp.json()
+            st.session_state.session_id = data["session_id"]
+            st.markdown(data["answer"])
 
-        # Hallucination report
-        if data.get("hallucination"):
-            h = data["hallucination"]
-            color = {"PASS": "green", "WARN": "orange", "FAIL": "red"}.get(h["verdict"], "gray")
-            st.markdown(
-                f"**Hallucination check:** :{color}[{h['verdict']}] — "
-                f"{h['supported_facts']}/{h['total_facts']} facts grounded "
-                f"({h['support_ratio']*100:.0f}%)"
-            )
-            if h["unsupported"]:
-                with st.expander("Unsupported facts"):
-                    for f in h["unsupported"]:
-                        st.caption(f"✗ {f}")
+            meta = {
+                "iterations":  data["iterations"],
+                "trace":        data["trace"],
+                "cited_chunks": data["cited_chunks"],
+                "hallucination": data.get("hallucination"),
+            }
+            _render_meta(meta)
 
-        st.divider()
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": data["answer"],
+                "meta": meta,
+            })
 
-        # ReAct trace
-        with st.expander(f"🔍 ReAct trace — {data['iterations']} steps"):
-            for step in data["trace"]:
-                icon = {"hybrid_search": "🔍", "expand_citations": "🕸",
-                        "check_contradiction": "⚖", "finalize_answer": "✓"}.get(step["tool"], "→")
-                st.markdown(f"**Step {step['iteration']} {icon} `{step['tool']}`**")
-                st.code(f"IN:  {step['input_summary'][:120]}\nOUT: {step['result_summary'][:120]}")
-
-        # Sources
-        if data["cited_chunks"]:
-            with st.expander(f"📚 Sources — {len(data['cited_chunks'])} chunks"):
-                for chunk in data["cited_chunks"]:
-                    st.markdown(f"**{chunk['paper_title']}** `{chunk['paper_id']}`")
-                    st.caption(f"Section: {chunk['section']}")
-                    st.text(chunk["text"][:300])
-                    st.divider()
-
-    elif resp.status_code == 429:
-        st.error(f"Rate limit: {resp.json().get('detail', '')}")
-    elif resp.status_code == 400:
-        st.warning(resp.json().get("detail", "No papers indexed yet."))
-    else:
-        st.error(f"Error {resp.status_code}: {resp.text[:200]}")
+        elif resp.status_code == 429:
+            st.error(f"Rate limit — {resp.json().get('detail', 'try again later')}")
+        elif resp.status_code == 400:
+            st.warning(resp.json().get("detail", "No papers indexed yet."))
+        else:
+            st.error(f"Error {resp.status_code}: {resp.text[:200]}")

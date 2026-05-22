@@ -1,3 +1,5 @@
+name: research-agent
+
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -17,6 +19,8 @@ services:
     env_file: .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     entrypoint: ["uvicorn", "paper_intel.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - papers_data:/app/data/papers
@@ -28,12 +32,26 @@ services:
       qdrant:
         condition: service_healthy
 
+  # Streamlit UI — lightweight dedicated image, no torch/scipy (~200 MB vs 3 GB)
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
   # One-shot CLI — only used for manual commands
   app:
     build: .
     env_file: .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     volumes:
       - papers_data:/app/data/papers
       - index_data:/app/data/index

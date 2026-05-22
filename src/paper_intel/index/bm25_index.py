@@ -11,22 +11,19 @@ class BM25Index:
     def __init__(self):
         self.bm25: BM25Okapi | None = None
         self.chunk_ids: list[str] = []
+        self._corpus: list[list[str]] = []  # keep raw tokens so we can rebuild incrementally
 
     def build(self, chunks: list[ChunkSchema]) -> None:
-        corpus = [_tokenize(c.text) for c in chunks]
+        self._corpus = [_tokenize(c.text) for c in chunks]
         self.chunk_ids = [c.chunk_id for c in chunks]
-        self.bm25 = BM25Okapi(corpus)
+        self.bm25 = BM25Okapi(self._corpus)
 
     def add_chunks(self, chunks: list[ChunkSchema]) -> None:
         """Rebuild index with additional chunks appended."""
-        if self.bm25 is None:
-            self.build(chunks)
-            return
-        # BM25Okapi doesn't support incremental updates — rebuild
-        existing_texts = list(self.bm25.corpus)
-        new_texts = [_tokenize(c.text) for c in chunks]
+        new_tokens = [_tokenize(c.text) for c in chunks]
+        self._corpus.extend(new_tokens)
         self.chunk_ids.extend(c.chunk_id for c in chunks)
-        self.bm25 = BM25Okapi(existing_texts + new_texts)
+        self.bm25 = BM25Okapi(self._corpus)
 
     def search(self, query: str, top_k: int = 20) -> list[tuple[str, float]]:
         if self.bm25 is None or not self.chunk_ids:
@@ -43,13 +40,18 @@ class BM25Index:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"bm25": self.bm25, "chunk_ids": self.chunk_ids}, f)
+            pickle.dump({
+                "chunk_ids": self.chunk_ids,
+                "corpus": self._corpus,
+            }, f)
 
     def load(self, path: Path) -> None:
         with open(path, "rb") as f:
             data = pickle.load(f)
-        self.bm25 = data["bm25"]
         self.chunk_ids = data["chunk_ids"]
+        self._corpus = data.get("corpus", [])
+        if self._corpus:
+            self.bm25 = BM25Okapi(self._corpus)
 
     def __len__(self) -> int:
         return len(self.chunk_ids)

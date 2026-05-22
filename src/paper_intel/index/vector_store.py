@@ -110,6 +110,23 @@ class VectorStore:
             ))
         return chunks
 
+    def get_paper_ids_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, str]:
+        """Return {chunk_id: paper_id} for the given chunk IDs."""
+        if not chunk_ids:
+            return {}
+        records = self.client.retrieve(
+            collection_name=COLLECTION,
+            ids=chunk_ids,
+            with_payload=["paper_id"],
+            with_vectors=False,
+        )
+        out: dict[str, str] = {}
+        for rec in records:
+            paper_id = (rec.payload or {}).get("paper_id")
+            if paper_id:
+                out[str(rec.id)] = str(paper_id)
+        return out
+
     def count(self) -> int:
         info = self.client.get_collection(COLLECTION)
         return info.points_count or 0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import threading
+import uuid as _uuid_lib
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -19,6 +20,12 @@ def _clean_section(section: str) -> str:
 
 # ── state loaded ONCE at startup, reused for every request ──────────────────
 _S: dict[str, Any] = {}
+
+# ── per-session conversation history (session_id → list of message dicts) ───
+# Each message: {"role": "user"|"assistant", "content": str}
+_SESSIONS: dict[str, list[dict]] = {}
+_SESSION_LOCK = threading.Lock()
+_MAX_HISTORY_TURNS = 10  # keep last N user+assistant pairs to cap context size
 
 # ── bulk ingestion progress (shared across threads) ─────────────────────────
 _PROGRESS: dict[str, Any] = {
@@ -92,8 +99,9 @@ app = FastAPI(title="Paper Intel API", version="0.1.0", lifespan=lifespan)
 
 class AskRequest(BaseModel):
     question: str
-    max_steps: int = 6
+    max_steps: int = 8
     eval_hallucination: bool = False
+    session_id: str | None = None   # omit for a fresh session; reuse to continue a chat
 
 
 class ChunkRef(BaseModel):
@@ -123,6 +131,7 @@ class AskResponse(BaseModel):
     question: str
     answer: str
     iterations: int
+    session_id: str             # echo back so client can continue the conversation
     trace: list[TraceStep]
     cited_chunks: list[ChunkRef]
     contradiction_flags: list[str]
@@ -153,6 +162,13 @@ def health():
     return {"status": "ok", "model": cfg.llm_model}
 
 
+@app.delete("/session/{session_id}")
+def clear_session(session_id: str):
+    with _SESSION_LOCK:
+        _SESSIONS.pop(session_id, None)
+    return {"cleared": session_id}
+
+
 @app.get("/status", response_model=StatusResponse)
 def status():
     store = _S["store"]
@@ -174,6 +190,11 @@ def ask(req: AskRequest):
     if _S["store"].count() == 0:
         raise HTTPException(status_code=400, detail="No papers indexed yet. POST /ingest first.")
 
+    # Session management — create or resume
+    sid = req.session_id or str(_uuid_lib.uuid4())
+    with _SESSION_LOCK:
+        history = list(_SESSIONS.get(sid, []))
+
     agent = ReactAgent(
         _S["client"],
         _S["executor"],
@@ -181,14 +202,21 @@ def ask(req: AskRequest):
         req.max_steps,
     )
     try:
-        output = agent.run(req.question)
+        output = agent.run(req.question, history=history)
     except RateLimitError as e:
-        import re
-        wait = re.search(r"try again in ([\w\d\.]+)", str(e))
-        detail = f"Groq rate limit reached. {('Try again in ' + wait.group(1)) if wait else 'Please wait and retry.'}"
+        import re as _re
+        wait = _re.search(r"try again in ([\w\d\.]+)", str(e))
+        detail = f"Rate limit reached. {('Try again in ' + wait.group(1)) if wait else 'Please wait and retry.'}"
         raise HTTPException(status_code=429, detail=detail)
     except Exception as e:
         msg = str(e)
+        if "APIConnectionError" in type(e).__name__ or "Connection error" in msg:
+            raise HTTPException(status_code=503,
+                                detail="LLM provider unreachable. Check your API key and network, then retry.")
+        if "402" in msg or "credits" in msg.lower() or "can only afford" in msg:
+            raise HTTPException(status_code=402,
+                                detail="OpenRouter credit balance exhausted. Add credits at https://openrouter.ai/settings/credits")
+
         if "model_permission" in msg or "403" in msg or "PermissionDenied" in type(e).__name__:
             raise HTTPException(
                 status_code=403,
@@ -203,10 +231,21 @@ def ask(req: AskRequest):
             )
         raise
 
+    # Persist this turn to the session (trim to last N turns to cap context)
+    with _SESSION_LOCK:
+        turns = _SESSIONS.get(sid, [])
+        turns = turns + [
+            {"role": "user",      "content": req.question},
+            {"role": "assistant", "content": output.answer},
+        ]
+        # Keep last _MAX_HISTORY_TURNS * 2 messages (each turn = 2 messages)
+        _SESSIONS[sid] = turns[-((_MAX_HISTORY_TURNS * 2)):]
+
     return AskResponse(
         question=output.question,
         answer=output.answer,
         iterations=output.iterations,
+        session_id=sid,
         trace=[
             TraceStep(
                 iteration=s.iteration,
